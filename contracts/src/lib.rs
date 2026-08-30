@@ -693,6 +693,183 @@ fn check_vesting_restrictions(env: &Env, owner: &Address, amount: u32) {
     }
 }
 
+// ── Issue #310: Function pause constants and helpers ────────────────────
+
+const FN_BUY_SHARES: u32 = 0;
+const FN_TRANSFER: u32 = 1;
+const FN_TRANSFER_FROM: u32 = 2;
+const FN_SELL_ORDER: u32 = 3;
+const FN_DIVIDEND: u32 = 4;
+const FN_BUYBACK: u32 = 5;
+
+/// Check if a specific function category is paused via bitmask.
+fn _is_function_paused(env: &Env, function_id: u32) -> bool {
+    let flags: u32 = env.storage().instance().get(&DataKey::FunctionPauseFlags).unwrap_or(0);
+    (flags & (1 << function_id)) != 0
+}
+
+/// Set or clear the pause flag for a specific function category.
+fn _set_function_paused(env: &Env, function_id: u32, paused: bool) {
+    let mut flags: u32 = env.storage().instance().get(&DataKey::FunctionPauseFlags).unwrap_or(0);
+    if paused {
+        flags |= 1 << function_id;
+    } else {
+        flags &= !(1 << function_id);
+    }
+    env.storage().instance().set(&DataKey::FunctionPauseFlags, &flags);
+}
+
+// ── Issue #311: Circuit breaker helpers ─────────────────────────────────
+
+/// Check if the circuit breaker has been triggered.
+fn _is_circuit_breaker_triggered(env: &Env) -> bool {
+    env.storage().instance().get(&DataKey::CircuitBreakerTriggered).unwrap_or(false)
+}
+
+/// Panics if the circuit breaker has been triggered.
+fn _require_circuit_breaker_clear(env: &Env) {
+    if _is_circuit_breaker_triggered(env) {
+        panic!("Circuit breaker is triggered: trading halted");
+    }
+}
+
+// ── Issue #270: Whitelist validation ───────────────────────────────────
+
+/// Validate that an address is whitelisted and not expired.
+fn _validate_whitelist(env: &Env, addr: &Address) {
+    // Must be in the whitelist
+    if !env.storage().persistent().get::<DataKey, bool>(&DataKey::Whitelisted(addr.clone())).unwrap_or(false) {
+        panic!("Address is not whitelisted");
+    }
+    // Check expiry if set
+    if let Some(expiry) = env.storage().persistent().get::<DataKey, u64>(&DataKey::WhitelistExpiry(addr.clone())) {
+        let now = env.ledger().timestamp();
+        if now > expiry {
+            panic!("Whitelist has expired for this address");
+        }
+    }
+}
+
+// ── Issue #268: Oracle-aware price helper ──────────────────────────────
+
+/// Get the current price per share. Uses the oracle if configured,
+/// otherwise falls back to the static PricePerShare.
+fn _get_current_price(env: &Env) -> i128 {
+    if let Some(oracle_addr) = env.storage().instance().get::<DataKey, Address>(&DataKey::OracleAddress) {
+        let oracle_client: OracleContractClient = OracleContractClient::new(env, &oracle_addr);
+        return oracle_client.get_price();
+    }
+    env.storage().instance().get(&DataKey::PricePerShare).unwrap_or(0)
+}
+
+// ── Issue #274: Purchase limit validation ──────────────────────────────
+
+/// Validate purchase limits for a buyer. Returns the updated purchase history.
+/// Panics if any limit is exceeded.
+fn _validate_purchase_limits(env: &Env, buyer: &Address, shares: u32, total_cost: i128) -> UserPurchaseHistory {
+    // Check if exempt
+    if env.storage().persistent().get::<DataKey, bool>(&DataKey::LimitExempt(buyer.clone())).unwrap_or(false) {
+        let mut history: UserPurchaseHistory = env.storage().persistent().get(&DataKey::UserPurchaseHistory(buyer.clone())).unwrap_or(UserPurchaseHistory {
+            last_purchase_time: 0, daily_shares: 0, daily_value: 0, day_start: 0,
+            weekly_shares: 0, weekly_value: 0, week_start: 0,
+            monthly_shares: 0, monthly_value: 0, month_start: 0,
+        });
+        let now = env.ledger().timestamp();
+        history.last_purchase_time = now;
+        return history;
+    }
+
+    let config: PurchaseLimitConfig = env.storage().instance().get(&DataKey::PurchaseLimitConfig)
+        .unwrap_or(PurchaseLimitConfig {
+            max_shares_per_user: 0,
+            max_value_per_user: 0,
+            daily_shares_limit: 0,
+            daily_value_limit: 0,
+            weekly_shares_limit: 0,
+            weekly_value_limit: 0,
+            monthly_shares_limit: 0,
+            monthly_value_limit: 0,
+            enabled: false,
+        });
+
+    if !config.enabled {
+        let mut history: UserPurchaseHistory = env.storage().persistent().get(&DataKey::UserPurchaseHistory(buyer.clone())).unwrap_or(UserPurchaseHistory {
+            last_purchase_time: 0, daily_shares: 0, daily_value: 0, day_start: 0,
+            weekly_shares: 0, weekly_value: 0, week_start: 0,
+            monthly_shares: 0, monthly_value: 0, month_start: 0,
+        });
+        history.last_purchase_time = env.ledger().timestamp();
+        return history;
+    }
+
+    let mut history: UserPurchaseHistory = env.storage().persistent().get(&DataKey::UserPurchaseHistory(buyer.clone())).unwrap_or(UserPurchaseHistory {
+        last_purchase_time: 0, daily_shares: 0, daily_value: 0, day_start: 0,
+        weekly_shares: 0, weekly_value: 0, week_start: 0,
+        monthly_shares: 0, monthly_value: 0, month_start: 0,
+    });
+    let now = env.ledger().timestamp();
+
+    // Get tier multiplier
+    let tier: u32 = env.storage().persistent().get(&DataKey::WhitelistTier(buyer.clone())).unwrap_or(0);
+    let multiplier: u32 = if tier > 0 && tier <= 2 {
+        let tier_limits: TierLimits = env.storage().instance().get(&DataKey::TierLimits(tier)).unwrap_or(TierLimits {
+            max_shares: 0,
+            max_value: 0,
+            daily_shares_multiplier: 10000,
+            daily_value_multiplier: 10000,
+        });
+        tier_limits.daily_shares_multiplier
+    } else {
+        10000
+    };
+
+    // Check per-transaction limits
+    if config.max_shares_per_user > 0 && shares > config.max_shares_per_user {
+        panic!("Purchase exceeds per-transaction share limit");
+    }
+    if config.max_value_per_user > 0 && total_cost > config.max_value_per_user {
+        panic!("Purchase exceeds per-transaction value limit");
+    }
+
+    // Check daily limits (with tier multiplier)
+    let effective_daily_shares = (config.daily_shares_limit as u64 * multiplier as u64) / 10000;
+    if effective_daily_shares > 0 && history.daily_shares as u64 + shares as u64 > effective_daily_shares {
+        panic!("Purchase would exceed daily share limit");
+    }
+    let effective_daily_value = (config.daily_value_limit as u128 * multiplier as u128) / 10000;
+    if effective_daily_value > 0 && history.daily_value as u128 + total_cost as u128 > effective_daily_value {
+        panic!("Purchase would exceed daily value limit");
+    }
+
+    // Check weekly limits
+    let effective_weekly_shares = (config.weekly_shares_limit as u64 * multiplier as u64) / 10000;
+    if effective_weekly_shares > 0 && history.weekly_shares as u64 + shares as u64 > effective_weekly_shares {
+        panic!("Purchase would exceed weekly share limit");
+    }
+
+    // Check monthly limits
+    let effective_monthly_shares = (config.monthly_shares_limit as u64 * multiplier as u64) / 10000;
+    if effective_monthly_shares > 0 && history.monthly_shares as u64 + shares as u64 > effective_monthly_shares {
+        panic!("Purchase would exceed monthly share limit");
+    }
+
+    // Update history
+    history.last_purchase_time = now;
+    history.daily_shares += shares;
+    history.daily_value += total_cost as i128;
+    history.weekly_shares += shares;
+    history.weekly_value += total_cost as i128;
+    history.monthly_shares += shares;
+    history.monthly_value += total_cost as i128;
+
+    history
+}
+
+/// Update purchase history after a successful purchase.
+fn _update_purchase_history(env: &Env, buyer: &Address, history: UserPurchaseHistory) {
+    env.storage().persistent().set(&DataKey::UserPurchaseHistory(buyer.clone()), &history);
+}
+
 #[contractimpl]
 impl RwaMarketplace {
     pub fn init(env: Env, admin: Address, payment_token: Address, price: i128, total_shares: u32) {
@@ -2740,7 +2917,7 @@ impl RwaMarketplace {
         let tx_hash: BytesN<32> = BytesN::from_array(&env, &[0; 32]); // Placeholder for actual tx hash
         record_transfer_history(&env, from.clone(), to.clone(), amount, fee, tx_hash);
 
-        EventTransfer { from, to, amount }.publish(&env);
+        EventTransfer { caller: from.clone(), from, to, amount }.publish(&env);
         reentrancy_guard_exit(&env);
     }
 
@@ -2847,7 +3024,7 @@ impl RwaMarketplace {
         let tx_hash: BytesN<32> = BytesN::from_array(&env, &[0; 32]); // Placeholder for actual tx hash
         record_transfer_history(&env, from.clone(), to.clone(), amount, fee, tx_hash);
 
-        EventTransfer { from, to, amount }.publish(&env);
+        EventTransfer { caller: spender.clone(), from, to, amount }.publish(&env);
         reentrancy_guard_exit(&env);
     }
 
@@ -3085,7 +3262,7 @@ impl RwaMarketplace {
             let tx_hash: BytesN<32> = BytesN::from_array(&env, &[0; 32]);
             record_transfer_history(&env, from.clone(), recipient.clone(), amount, fee, tx_hash);
 
-            EventTransfer { from: from.clone(), to: recipient.clone(), amount }.publish(&env);
+            EventTransfer { caller: from.clone(), from: from.clone(), to: recipient.clone(), amount }.publish(&env);
         }
 
         // Deduct from sender balance
@@ -3286,7 +3463,7 @@ impl RwaMarketplace {
             .set(&DataKey::AvailableShares, &checked_add_u32(available, amount));
 
         _set_non_reentrant(&env, false);
-        EventBuybackShares { seller, amount, total_cost }.publish(&env);
+        EventBuybackShares { caller: seller.clone(), seller, amount, total_cost }.publish(&env);
     }
 
     /// Admin sets the auto-buyback configuration.
