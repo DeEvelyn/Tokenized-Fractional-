@@ -213,6 +213,9 @@ const MarketplacePage = React.memo(
             loading={isFetchingAssets}
             error={assetsError}
             isEmpty={!isFetchingAssets && !assetsError && assets.length === 0}
+            hasNextPage={hasNextPage}
+            onLoadMore={() => fetchNextPage(API_URL)}
+            loadingMore={isFetchingAssets}
           />
         </section>
 
@@ -280,7 +283,9 @@ function App() {
     isFetchingAssets,
     assetsError,
     fetchAllAssets,
+    fetchNextPage,
     fetchMetadata,
+    hasNextPage,
     clearMeta,
     clearAssets,
   } = useAssetStore();
@@ -946,6 +951,9 @@ function App() {
                       loading={isFetchingAssets}
                       error={assetsError}
                       isEmpty={!isFetchingAssets && !assetsError && filteredAssets.length === 0}
+                      hasNextPage={hasNextPage}
+                      onLoadMore={() => fetchNextPage(API_URL)}
+                      loadingMore={isFetchingAssets}
                     />
                   </>
                 );
