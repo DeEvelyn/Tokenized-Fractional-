@@ -93,6 +93,56 @@ pub enum DataKey {
     ReentrancyGuard,
     /// Compliance whitelist for transfers
     TransferWhitelist(Address),
+
+    // ── Issue #494: additional storage keys used throughout the contract ──
+    /// Contract metadata (name, version, description)
+    ContractMetadata,
+    /// Oracle contract address
+    OracleAddress,
+    /// Bridge-locked shares per user
+    BridgeLocked(Address),
+    /// Buyback request counter (auto-increment ID)
+    BuybackRequestCounter,
+    /// Individual buyback request by ID
+    BuybackRequest(u64),
+    /// Circuit breaker configuration
+    CircuitBreakerConfig,
+    /// Whether the circuit breaker has been triggered
+    CircuitBreakerTriggered,
+    /// Circuit breaker trigger count
+    CircuitBreakerTriggerCount,
+    /// Per-function pause flags bitmask
+    FunctionPauseFlags,
+    /// Contract implementation version
+    ImplementationVersion,
+    /// Last snapshot ledger sequence
+    LastSnapshotLedger,
+    /// Address is exempt from purchase limits
+    LimitExempt(Address),
+    /// Limit violation count per address
+    LimitViolations(Address),
+    /// Pending upgrade configuration
+    PendingUpgrade,
+    /// Purchase limit configuration
+    PurchaseLimitConfig,
+    /// Recovery mode enabled flag
+    RecoveryEnabled,
+    /// Snapshot counter (auto-increment ID)
+    SnapshotCount,
+    /// Tier-specific limits (0=standard, 1=premium, 2=institutional)
+    TierLimits(u32),
+    /// Transfer fee in basis points
+    TransferFeeBps,
+    /// Transfer fee collector address
+    TransferFeeCollector,
+    /// Upgrade timelock in seconds
+    UpgradeTimelock,
+    /// User purchase history for limit tracking
+    UserPurchaseHistory(Address),
+    /// Whitelist expiry timestamp per address
+    WhitelistExpiry(Address),
+    /// Whitelist tier per address (0=standard, 1=premium, 2=institutional)
+    WhitelistTier(Address),
 }
 
 #[contracttype]
@@ -226,6 +276,73 @@ pub struct TransferApproval {
     pub amount: u32,
     pub requested_at: u64,
     pub approved: bool,
+}
+
+// ── Issue #494: Additional struct definitions for missing DataKey variants ──
+
+#[contracttype]
+#[derive(Clone)]
+pub struct CircuitBreakerConfig {
+    pub enabled: bool,
+    pub max_price_change_bps: u32,
+    pub max_volume_per_block: u64,
+    pub armed: bool,
+}
+
+#[contracttype]
+#[derive(Clone)]
+pub struct UpgradeConfig {
+    pub new_wasm_hash: soroban_sdk::BytesN<32>,
+    pub scheduled_ledger: u64,
+    pub proposer: Address,
+}
+
+#[contracttype]
+#[derive(Clone)]
+pub struct BuybackRequest {
+    pub request_id: u64,
+    pub seller: Address,
+    pub amount: u32,
+    pub requested_price: i128,
+    pub timestamp: u64,
+}
+
+#[contracttype]
+#[derive(Clone)]
+pub struct PurchaseLimitConfig {
+    pub max_shares_per_user: u32,
+    pub max_value_per_user: i128,
+    pub daily_shares_limit: u32,
+    pub daily_value_limit: i128,
+    pub weekly_shares_limit: u32,
+    pub weekly_value_limit: i128,
+    pub monthly_shares_limit: u32,
+    pub monthly_value_limit: i128,
+    pub enabled: bool,
+}
+
+#[contracttype]
+#[derive(Clone)]
+pub struct TierLimits {
+    pub max_shares: u32,
+    pub max_value: i128,
+    pub daily_shares_multiplier: u32,
+    pub daily_value_multiplier: u32,
+}
+
+#[contracttype]
+#[derive(Clone)]
+pub struct UserPurchaseHistory {
+    pub last_purchase_time: u64,
+    pub daily_shares: u32,
+    pub daily_value: i128,
+    pub day_start: u64,
+    pub weekly_shares: u32,
+    pub weekly_value: i128,
+    pub week_start: u64,
+    pub monthly_shares: u32,
+    pub monthly_value: i128,
+    pub month_start: u64,
 }
 
 #[contracttype]
@@ -5227,7 +5344,7 @@ mod test {
         amounts.push_back(30);
         amounts.push_back(20);
 
-        c.batch_transfer(&te.buyer, recipients, amounts);
+        c.batch_transfer(&te.buyer, &recipients, &amounts);
 
         assert_eq!(c.get_shares(&te.buyer), 50);
         assert_eq!(c.get_shares(&recipient1), 30);
@@ -5246,7 +5363,7 @@ mod test {
 
         let recipients: Vec<Address> = Vec::new(&te.env);
         let amounts: Vec<u32> = Vec::new(&te.env);
-        c.batch_transfer(&te.buyer, recipients, amounts);
+        c.batch_transfer(&te.buyer, &recipients, &amounts);
     }
 
     #[test]
@@ -5266,7 +5383,7 @@ mod test {
         amounts.push_back(10);
         amounts.push_back(20);
 
-        c.batch_transfer(&te.buyer, recipients, amounts);
+        c.batch_transfer(&te.buyer, &recipients, &amounts);
     }
 
     #[test]
@@ -5571,7 +5688,7 @@ mod test {
         amounts.push_back(30);
         amounts.push_back(20);
 
-        c.batch_transfer(&te.buyer, recipients, amounts);
+        c.batch_transfer(&te.buyer, &recipients, &amounts);
 
         // Total fee: (30 + 20) * 100 * 0.01 = 50 tokens
         let token_client = token::TokenClient::new(&te.env, &te.token_id);
@@ -6588,7 +6705,7 @@ mod fuzz_dividend_distribution {
 mod vesting_analytics_tests {
     use super::*;
     use soroban_sdk::testutils::Address as _;
-    use token::TokenClient;
+    use token::StellarAssetClient;
 
     struct TestEnv {
         env: soroban_sdk::Env,
@@ -6609,7 +6726,7 @@ mod vesting_analytics_tests {
         c.init(&admin, &token_id, &100, &1000);
 
         // Mint tokens and whitelist buyer for test setup
-        let token_client = TokenClient::new(&env, &token_id);
+        let token_client = StellarAssetClient::new(&env, &token_id);
         token_client.mint(&buyer, &100_000_i128);
         c.add_to_whitelist(&buyer);
 
