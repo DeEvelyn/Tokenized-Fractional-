@@ -71,3 +71,40 @@ export const CANCEL_ORDER = `
     }
   }
 `;
+
+// Issue #513: Relay-compliant cursor-based pagination for asset listings
+export const GET_ASSETS_PAGINATED = `
+  query GetAssetsPaginated($filter: AssetFilter) {
+    assets(filter: $filter) {
+      data {
+        contractId
+        title
+        location
+        description
+        assetType
+        imageUrl
+        totalValuation
+        createdAt
+        updatedAt
+      }
+      pageInfo {
+        hasNextPage
+        hasPreviousPage
+        startCursor
+        endCursor
+      }
+    }
+  }
+`;
+
+/**
+ * Helper: Build cursor-based pagination variables.
+ * @param {object} opts - { first, after, assetType, search }
+ */
+export function buildAssetsVariables({ first = 20, after = null, assetType = null, search = null } = {}) {
+  const filter = { first };
+  if (after) filter.after = after;
+  if (assetType) filter.assetType = assetType;
+  if (search) filter.search = search;
+  return { filter };
+}

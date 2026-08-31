@@ -23,3 +23,35 @@ jobs:
           base: "${{ github.event.pull_request.base.sha || 'HEAD^' }}"
           head: "${{ github.event.pull_request.head.sha || 'HEAD' }}"
           extra_args: --debug --only-verified=false
+
+  # Issue #514: Fuzz testing for Soroban smart contracts
+  fuzz-tests:
+    name: Soroban Fuzz Tests (proptest)
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Cache cargo registry & build
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            contracts/target
+          key: ${{ runner.os }}-cargo-${{ hashFiles('contracts/Cargo.lock') }}
+          restore-keys: |
+            ${{ runner.os }}-cargo-
+
+      - name: Run fuzz tests (proptest)
+        run: cargo test --lib property_tests::fuzz_ -- --test-threads=1
+        working-directory: contracts
+        env:
+          PROPTEST_CASES: 50
+
+      - name: Run all contract tests
+        run: cargo test --workspace --verbose
+        working-directory: contracts

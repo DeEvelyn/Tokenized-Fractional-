@@ -1,0 +1,29 @@
+# Staging Environment Configuration
+# Issue #515: Staging Environment Deployment Pipeline
+#
+# Copy this file to terraform.tfvars.staging and fill in the values.
+# These variables configure an isolated staging environment that uses
+# Stellar Testnet for smart contract interactions.
+
+# ── Stellar Testnet ─────────────────────────────────────────────────────
+stellar_network        = "testnet"
+stellar_horizon_url    = "https://horizon-testnet.stellar.org"
+stellar_rpc_url        = "https://soroban-testnet.stellar.org"
+
+# ── Backend ─────────────────────────────────────────────────────────────
+backend_replicas       = 1
+backend_instance_type  = "t3.small"
+
+# ── Database ────────────────────────────────────────────────────────────
+db_instance_class      = "db.t3.micro"
+db_name                = "rwa_staging"
+db_backup_retention    = 1
+
+# ── Redis ───────────────────────────────────────────────────────────────
+redis_instance_class   = "cache.t3.micro"
+
+# ── API Key ─────────────────────────────────────────────────────────────
+api_key_tier           = "standard"
+
+# ── Environment ─────────────────────────────────────────────────────────
+environment            = "staging"

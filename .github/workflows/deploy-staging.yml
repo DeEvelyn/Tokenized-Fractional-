@@ -1,0 +1,229 @@
+# Issue #515: Staging Environment Deployment Pipeline
+# Triggers on pushes to the develop branch and deploys to isolated staging
+# infrastructure using Stellar Testnet for smart contract interactions.
+
+name: Deploy to Staging
+
+on:
+  push:
+    branches: [develop]
+  pull_request:
+    branches: [develop]
+
+env:
+  STELLAR_NETWORK: testnet
+  STELLAR_HORIZON_URL: https://horizon-testnet.stellar.org
+  STELLAR_RPC_URL: https://soroban-testnet.stellar.org
+  BACKEND_STAGING_URL: ${{ secrets.STAGING_BACKEND_SERVICE_URL }}
+  FRONTEND_STAGING_URL: ${{ secrets.STAGING_FRONTEND_SERVICE_URL }}
+
+jobs:
+  # ── Pre-deploy validation ──────────────────────────────────────────────
+  validate:
+    name: Validate Staging Readiness
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Verify develop branch
+        run: |
+          if [ "${{ github.ref_name }}" != "develop" ]; then
+            echo "::warning::Not on develop branch — skipping staging deployment"
+            exit 0
+          fi
+
+      - name: Check required secrets
+        run: |
+          required_secrets=(
+            "STAGING_BACKEND_DEPLOY_HOOK"
+            "STAGING_FRONTEND_DEPLOY_HOOK"
+            "STAGING_BACKEND_SERVICE_URL"
+            "STAGING_FRONTEND_SERVICE_URL"
+          )
+          for secret in "${required_secrets[@]}"; do
+            if [ -z "${{ secrets[secret] }}" ]; then
+              echo "::error::Missing required staging secret: $secret"
+              exit 1
+            fi
+          done
+          echo "All required staging secrets are configured."
+
+  # ── Run tests before deploying to staging ──────────────────────────────
+  test:
+    name: Run Test Suite
+    needs: validate
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: 20
+          cache: npm
+          cache-dependency-path: backend/package-lock.json
+
+      - name: Install backend dependencies
+        run: npm ci
+        working-directory: backend
+
+      - name: Run backend tests
+        run: npm test
+        working-directory: backend
+        env:
+          NODE_ENV: test
+          ANOMALY_DETECTION_ENABLED: "false"
+          GEO_LIMITING_ENABLED: "false"
+
+      - name: Run backend linting
+        run: npm run lint:ci || true
+        working-directory: backend
+
+  # ── Deploy backend to staging ──────────────────────────────────────────
+  deploy-backend:
+    name: Deploy Backend (Staging)
+    needs: [validate, test]
+    if: github.ref_name == 'develop' && github.event_name == 'push'
+    runs-on: ubuntu-latest
+    outputs:
+      deploy_status: ${{ steps.healthcheck.outputs.status }}
+      backend_url: ${{ env.BACKEND_STAGING_URL }}
+    steps:
+      - name: Trigger staging backend deploy
+        id: deploy
+        run: |
+          curl -f -X POST "${{ secrets.STAGING_BACKEND_DEPLOY_HOOK }}"
+          echo "deploy_id=$(date +%s)" >> "$GITHUB_OUTPUT"
+
+      - name: Wait for deployment to stabilize
+        run: sleep 45
+
+      - name: Health check
+        id: healthcheck
+        run: |
+          echo "Checking staging backend health at ${BACKEND_STAGING_URL}/health"
+          for i in 1 2 3 4 5 6; do
+            HTTP_STATUS=$(curl -s -o /dev/null -w "%{http_code}" "${BACKEND_STAGING_URL}/health" || true)
+            if [ "$HTTP_STATUS" = "200" ]; then
+              echo "status=healthy" >> "$GITHUB_OUTPUT"
+              echo "Backend staging health check passed (attempt $i)"
+              exit 0
+            fi
+            echo "Attempt $i: status=$HTTP_STATUS, retrying in 15s..."
+            sleep 15
+          done
+          echo "status=unhealthy" >> "$GITHUB_OUTPUT"
+          echo "::error::Staging backend health check failed after 6 attempts"
+          exit 1
+
+      - name: Verify Stellar Testnet connectivity
+        run: |
+          echo "Verifying Stellar Testnet connectivity..."
+          HTTP_STATUS=$(curl -s -o /dev/null -w "%{http_code}" "${STELLAR_HORIZON_URL}/" || true)
+          if [ "$HTTP_STATUS" = "200" ]; then
+            echo "Stellar Testnet is reachable."
+          else
+            echo "::warning::Stellar Testnet returned status $HTTP_STATUS"
+          fi
+
+      - name: Notify deployment status
+        if: always()
+        run: |
+          STATUS="${{ steps.healthcheck.outputs.status || 'failed' }}"
+          if [ "$STATUS" = "healthy" ]; then
+            echo "Staging backend deployment succeeded and is healthy."
+          else
+            echo "::warning::Staging backend deployment failed or health check unsuccessful."
+          fi
+
+  # ── Deploy frontend to staging ─────────────────────────────────────────
+  deploy-frontend:
+    name: Deploy Frontend (Staging)
+    needs: [validate, deploy-backend]
+    if: needs.deploy-backend.outputs.deploy_status == 'healthy'
+    runs-on: ubuntu-latest
+    steps:
+      - name: Trigger staging frontend deploy
+        id: deploy
+        run: |
+          curl -f -X POST "${{ secrets.STAGING_FRONTEND_DEPLOY_HOOK }}"
+          echo "deploy_id=$(date +%s)" >> "$GITHUB_OUTPUT"
+
+      - name: Wait for deployment to stabilize
+        run: sleep 45
+
+      - name: Health check
+        id: healthcheck
+        run: |
+          echo "Checking staging frontend health at ${FRONTEND_STAGING_URL}"
+          for i in 1 2 3 4 5 6; do
+            HTTP_STATUS=$(curl -s -o /dev/null -w "%{http_code}" "${FRONTEND_STAGING_URL}" || true)
+            if [ "$HTTP_STATUS" = "200" ]; then
+              echo "status=healthy" >> "$GITHUB_OUTPUT"
+              echo "Staging frontend health check passed (attempt $i)"
+              exit 0
+            fi
+            echo "Attempt $i: status=$HTTP_STATUS, retrying in 15s..."
+            sleep 15
+          done
+          echo "status=unhealthy" >> "$GITHUB_OUTPUT"
+          echo "::error::Staging frontend health check failed after 6 attempts"
+          exit 1
+
+      - name: Notify deployment status
+        if: always()
+        run: |
+          STATUS="${{ steps.healthcheck.outputs.status || 'failed' }}"
+          if [ "$STATUS" = "healthy" ]; then
+            echo "Staging frontend deployment succeeded and is healthy."
+          else
+            echo "::warning::Staging frontend deployment failed or health check unsuccessful."
+          fi
+
+  # ── Smoke tests against staging ────────────────────────────────────────
+  smoke-test:
+    name: Staging Smoke Tests
+    needs: [deploy-backend, deploy-frontend]
+    if: needs.deploy-backend.outputs.deploy_status == 'healthy'
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: 20
+
+      - name: Verify staging API responds
+        run: |
+          echo "Running smoke tests against staging..."
+          BACKEND_URL="${{ needs.deploy-backend.outputs.backend_url }}"
+
+          # Test health endpoint
+          HTTP_STATUS=$(curl -s -o /dev/null -w "%{http_code}" "${BACKEND_URL}/health")
+          if [ "$HTTP_STATUS" != "200" ]; then
+            echo "::error::Staging health check failed with status $HTTP_STATUS"
+            exit 1
+          fi
+          echo "✓ Health check passed"
+
+          # Test assets endpoint
+          HTTP_STATUS=$(curl -s -o /dev/null -w "%{http_code}" "${BACKEND_URL}/api/v1/rwa")
+          if [ "$HTTP_STATUS" != "200" ]; then
+            echo "::error::Staging assets endpoint failed with status $HTTP_STATUS"
+            exit 1
+          fi
+          echo "✓ Assets endpoint passed"
+
+          # Test GraphQL endpoint
+          HTTP_STATUS=$(curl -s -o /dev/null -w "%{http_code}" "${BACKEND_URL}/api/graphql?query={queryComplexity{score}}")
+          if [ "$HTTP_STATUS" != "200" ]; then
+            echo "::error::Staging GraphQL endpoint failed with status $HTTP_STATUS"
+            exit 1
+          fi
+          echo "✓ GraphQL endpoint passed"
+
+          echo "All smoke tests passed!"

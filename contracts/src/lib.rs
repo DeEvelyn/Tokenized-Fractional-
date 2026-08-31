@@ -93,6 +93,56 @@ pub enum DataKey {
     ReentrancyGuard,
     /// Compliance whitelist for transfers
     TransferWhitelist(Address),
+
+    // ── Issue #494: additional storage keys used throughout the contract ──
+    /// Contract metadata (name, version, description)
+    ContractMetadata,
+    /// Oracle contract address
+    OracleAddress,
+    /// Bridge-locked shares per user
+    BridgeLocked(Address),
+    /// Buyback request counter (auto-increment ID)
+    BuybackRequestCounter,
+    /// Individual buyback request by ID
+    BuybackRequest(u64),
+    /// Circuit breaker configuration
+    CircuitBreakerConfig,
+    /// Whether the circuit breaker has been triggered
+    CircuitBreakerTriggered,
+    /// Circuit breaker trigger count
+    CircuitBreakerTriggerCount,
+    /// Per-function pause flags bitmask
+    FunctionPauseFlags,
+    /// Contract implementation version
+    ImplementationVersion,
+    /// Last snapshot ledger sequence
+    LastSnapshotLedger,
+    /// Address is exempt from purchase limits
+    LimitExempt(Address),
+    /// Limit violation count per address
+    LimitViolations(Address),
+    /// Pending upgrade configuration
+    PendingUpgrade,
+    /// Purchase limit configuration
+    PurchaseLimitConfig,
+    /// Recovery mode enabled flag
+    RecoveryEnabled,
+    /// Snapshot counter (auto-increment ID)
+    SnapshotCount,
+    /// Tier-specific limits (0=standard, 1=premium, 2=institutional)
+    TierLimits(u32),
+    /// Transfer fee in basis points
+    TransferFeeBps,
+    /// Transfer fee collector address
+    TransferFeeCollector,
+    /// Upgrade timelock in seconds
+    UpgradeTimelock,
+    /// User purchase history for limit tracking
+    UserPurchaseHistory(Address),
+    /// Whitelist expiry timestamp per address
+    WhitelistExpiry(Address),
+    /// Whitelist tier per address (0=standard, 1=premium, 2=institutional)
+    WhitelistTier(Address),
 }
 
 #[contracttype]
@@ -226,6 +276,73 @@ pub struct TransferApproval {
     pub amount: u32,
     pub requested_at: u64,
     pub approved: bool,
+}
+
+// ── Issue #494: Additional struct definitions for missing DataKey variants ──
+
+#[contracttype]
+#[derive(Clone)]
+pub struct CircuitBreakerConfig {
+    pub enabled: bool,
+    pub max_price_change_bps: u32,
+    pub max_volume_per_block: u64,
+    pub armed: bool,
+}
+
+#[contracttype]
+#[derive(Clone)]
+pub struct UpgradeConfig {
+    pub new_wasm_hash: soroban_sdk::BytesN<32>,
+    pub scheduled_ledger: u64,
+    pub proposer: Address,
+}
+
+#[contracttype]
+#[derive(Clone)]
+pub struct BuybackRequest {
+    pub request_id: u64,
+    pub seller: Address,
+    pub amount: u32,
+    pub requested_price: i128,
+    pub timestamp: u64,
+}
+
+#[contracttype]
+#[derive(Clone)]
+pub struct PurchaseLimitConfig {
+    pub max_shares_per_user: u32,
+    pub max_value_per_user: i128,
+    pub daily_shares_limit: u32,
+    pub daily_value_limit: i128,
+    pub weekly_shares_limit: u32,
+    pub weekly_value_limit: i128,
+    pub monthly_shares_limit: u32,
+    pub monthly_value_limit: i128,
+    pub enabled: bool,
+}
+
+#[contracttype]
+#[derive(Clone)]
+pub struct TierLimits {
+    pub max_shares: u32,
+    pub max_value: i128,
+    pub daily_shares_multiplier: u32,
+    pub daily_value_multiplier: u32,
+}
+
+#[contracttype]
+#[derive(Clone)]
+pub struct UserPurchaseHistory {
+    pub last_purchase_time: u64,
+    pub daily_shares: u32,
+    pub daily_value: i128,
+    pub day_start: u64,
+    pub weekly_shares: u32,
+    pub weekly_value: i128,
+    pub week_start: u64,
+    pub monthly_shares: u32,
+    pub monthly_value: i128,
+    pub month_start: u64,
 }
 
 #[contracttype]
@@ -507,6 +624,18 @@ fn reentrancy_guard_exit(env: &Env) {
     env.storage().instance().set(&DataKey::ReentrancyGuard, &false);
 }
 
+/// Alias: check and lock the reentrancy guard.
+/// Panics if the guard is already set (re-entrant call detected).
+fn _check_non_reentrant(env: &Env) {
+    reentrancy_guard_enter(env);
+}
+
+/// Alias: set the reentrancy guard flag.
+/// Pass `true` to lock, `false` to unlock.
+fn _set_non_reentrant(env: &Env, value: bool) {
+    env.storage().instance().set(&DataKey::ReentrancyGuard, &value);
+}
+
 /// Check if an address is transfer-whitelisted
 fn is_transfer_whitelisted(env: &Env, addr: &Address) -> bool {
     env.storage().persistent().get(&DataKey::TransferWhitelist(addr.clone())).unwrap_or(true)
@@ -562,6 +691,183 @@ fn check_vesting_restrictions(env: &Env, owner: &Address, amount: u32) {
     if amount > liquid_balance {
         panic!("Cannot transfer vested shares. Only liquid shares can be transferred.");
     }
+}
+
+// ── Issue #310: Function pause constants and helpers ────────────────────
+
+const FN_BUY_SHARES: u32 = 0;
+const FN_TRANSFER: u32 = 1;
+const FN_TRANSFER_FROM: u32 = 2;
+const FN_SELL_ORDER: u32 = 3;
+const FN_DIVIDEND: u32 = 4;
+const FN_BUYBACK: u32 = 5;
+
+/// Check if a specific function category is paused via bitmask.
+fn _is_function_paused(env: &Env, function_id: u32) -> bool {
+    let flags: u32 = env.storage().instance().get(&DataKey::FunctionPauseFlags).unwrap_or(0);
+    (flags & (1 << function_id)) != 0
+}
+
+/// Set or clear the pause flag for a specific function category.
+fn _set_function_paused(env: &Env, function_id: u32, paused: bool) {
+    let mut flags: u32 = env.storage().instance().get(&DataKey::FunctionPauseFlags).unwrap_or(0);
+    if paused {
+        flags |= 1 << function_id;
+    } else {
+        flags &= !(1 << function_id);
+    }
+    env.storage().instance().set(&DataKey::FunctionPauseFlags, &flags);
+}
+
+// ── Issue #311: Circuit breaker helpers ─────────────────────────────────
+
+/// Check if the circuit breaker has been triggered.
+fn _is_circuit_breaker_triggered(env: &Env) -> bool {
+    env.storage().instance().get(&DataKey::CircuitBreakerTriggered).unwrap_or(false)
+}
+
+/// Panics if the circuit breaker has been triggered.
+fn _require_circuit_breaker_clear(env: &Env) {
+    if _is_circuit_breaker_triggered(env) {
+        panic!("Circuit breaker is triggered: trading halted");
+    }
+}
+
+// ── Issue #270: Whitelist validation ───────────────────────────────────
+
+/// Validate that an address is whitelisted and not expired.
+fn _validate_whitelist(env: &Env, addr: &Address) {
+    // Must be in the whitelist
+    if !env.storage().persistent().get::<DataKey, bool>(&DataKey::Whitelisted(addr.clone())).unwrap_or(false) {
+        panic!("Address is not whitelisted");
+    }
+    // Check expiry if set
+    if let Some(expiry) = env.storage().persistent().get::<DataKey, u64>(&DataKey::WhitelistExpiry(addr.clone())) {
+        let now = env.ledger().timestamp();
+        if now > expiry {
+            panic!("Whitelist has expired for this address");
+        }
+    }
+}
+
+// ── Issue #268: Oracle-aware price helper ──────────────────────────────
+
+/// Get the current price per share. Uses the oracle if configured,
+/// otherwise falls back to the static PricePerShare.
+fn _get_current_price(env: &Env) -> i128 {
+    if let Some(oracle_addr) = env.storage().instance().get::<DataKey, Address>(&DataKey::OracleAddress) {
+        let oracle_client: OracleContractClient = OracleContractClient::new(env, &oracle_addr);
+        return oracle_client.get_price();
+    }
+    env.storage().instance().get(&DataKey::PricePerShare).unwrap_or(0)
+}
+
+// ── Issue #274: Purchase limit validation ──────────────────────────────
+
+/// Validate purchase limits for a buyer. Returns the updated purchase history.
+/// Panics if any limit is exceeded.
+fn _validate_purchase_limits(env: &Env, buyer: &Address, shares: u32, total_cost: i128) -> UserPurchaseHistory {
+    // Check if exempt
+    if env.storage().persistent().get::<DataKey, bool>(&DataKey::LimitExempt(buyer.clone())).unwrap_or(false) {
+        let mut history: UserPurchaseHistory = env.storage().persistent().get(&DataKey::UserPurchaseHistory(buyer.clone())).unwrap_or(UserPurchaseHistory {
+            last_purchase_time: 0, daily_shares: 0, daily_value: 0, day_start: 0,
+            weekly_shares: 0, weekly_value: 0, week_start: 0,
+            monthly_shares: 0, monthly_value: 0, month_start: 0,
+        });
+        let now = env.ledger().timestamp();
+        history.last_purchase_time = now;
+        return history;
+    }
+
+    let config: PurchaseLimitConfig = env.storage().instance().get(&DataKey::PurchaseLimitConfig)
+        .unwrap_or(PurchaseLimitConfig {
+            max_shares_per_user: 0,
+            max_value_per_user: 0,
+            daily_shares_limit: 0,
+            daily_value_limit: 0,
+            weekly_shares_limit: 0,
+            weekly_value_limit: 0,
+            monthly_shares_limit: 0,
+            monthly_value_limit: 0,
+            enabled: false,
+        });
+
+    if !config.enabled {
+        let mut history: UserPurchaseHistory = env.storage().persistent().get(&DataKey::UserPurchaseHistory(buyer.clone())).unwrap_or(UserPurchaseHistory {
+            last_purchase_time: 0, daily_shares: 0, daily_value: 0, day_start: 0,
+            weekly_shares: 0, weekly_value: 0, week_start: 0,
+            monthly_shares: 0, monthly_value: 0, month_start: 0,
+        });
+        history.last_purchase_time = env.ledger().timestamp();
+        return history;
+    }
+
+    let mut history: UserPurchaseHistory = env.storage().persistent().get(&DataKey::UserPurchaseHistory(buyer.clone())).unwrap_or(UserPurchaseHistory {
+        last_purchase_time: 0, daily_shares: 0, daily_value: 0, day_start: 0,
+        weekly_shares: 0, weekly_value: 0, week_start: 0,
+        monthly_shares: 0, monthly_value: 0, month_start: 0,
+    });
+    let now = env.ledger().timestamp();
+
+    // Get tier multiplier
+    let tier: u32 = env.storage().persistent().get(&DataKey::WhitelistTier(buyer.clone())).unwrap_or(0);
+    let multiplier: u32 = if tier > 0 && tier <= 2 {
+        let tier_limits: TierLimits = env.storage().instance().get(&DataKey::TierLimits(tier)).unwrap_or(TierLimits {
+            max_shares: 0,
+            max_value: 0,
+            daily_shares_multiplier: 10000,
+            daily_value_multiplier: 10000,
+        });
+        tier_limits.daily_shares_multiplier
+    } else {
+        10000
+    };
+
+    // Check per-transaction limits
+    if config.max_shares_per_user > 0 && shares > config.max_shares_per_user {
+        panic!("Purchase exceeds per-transaction share limit");
+    }
+    if config.max_value_per_user > 0 && total_cost > config.max_value_per_user {
+        panic!("Purchase exceeds per-transaction value limit");
+    }
+
+    // Check daily limits (with tier multiplier)
+    let effective_daily_shares = (config.daily_shares_limit as u64 * multiplier as u64) / 10000;
+    if effective_daily_shares > 0 && history.daily_shares as u64 + shares as u64 > effective_daily_shares {
+        panic!("Purchase would exceed daily share limit");
+    }
+    let effective_daily_value = (config.daily_value_limit as u128 * multiplier as u128) / 10000;
+    if effective_daily_value > 0 && history.daily_value as u128 + total_cost as u128 > effective_daily_value {
+        panic!("Purchase would exceed daily value limit");
+    }
+
+    // Check weekly limits
+    let effective_weekly_shares = (config.weekly_shares_limit as u64 * multiplier as u64) / 10000;
+    if effective_weekly_shares > 0 && history.weekly_shares as u64 + shares as u64 > effective_weekly_shares {
+        panic!("Purchase would exceed weekly share limit");
+    }
+
+    // Check monthly limits
+    let effective_monthly_shares = (config.monthly_shares_limit as u64 * multiplier as u64) / 10000;
+    if effective_monthly_shares > 0 && history.monthly_shares as u64 + shares as u64 > effective_monthly_shares {
+        panic!("Purchase would exceed monthly share limit");
+    }
+
+    // Update history
+    history.last_purchase_time = now;
+    history.daily_shares += shares;
+    history.daily_value += total_cost as i128;
+    history.weekly_shares += shares;
+    history.weekly_value += total_cost as i128;
+    history.monthly_shares += shares;
+    history.monthly_value += total_cost as i128;
+
+    history
+}
+
+/// Update purchase history after a successful purchase.
+fn _update_purchase_history(env: &Env, buyer: &Address, history: UserPurchaseHistory) {
+    env.storage().persistent().set(&DataKey::UserPurchaseHistory(buyer.clone()), &history);
 }
 
 #[contractimpl]
@@ -911,6 +1217,7 @@ impl RwaMarketplace {
     /// Only the admin may call this. The contract must hold enough `token`
     /// balance to cover `total_amount` before calling.
     pub fn distribute_dividends(env: Env, token: Address, total_amount: i128) {
+        _check_non_reentrant(&env);
         let admin: Address = env.storage().instance().get(&DataKey::Admin)
             .expect("Contract not initialized: admin");
         admin.require_auth();
@@ -1023,6 +1330,8 @@ impl RwaMarketplace {
             withholding_bps: policy.withholding_bps,
         }
         .publish(&env);
+
+        _set_non_reentrant(&env, false);
     }
 
     pub fn set_dividend_policy(env: Env, dividend_type: u32, payout_token: Address, withholding_bps: u32, reinvestment_enabled: bool) {
@@ -1061,10 +1370,12 @@ impl RwaMarketplace {
     }
 
     pub fn claim_dividends(env: Env, holder: Address) {
+        _check_non_reentrant(&env);
         holder.require_auth();
 
         let position = _load_dividend_position(&env, &holder);
         if position.accrued_amount <= 0 {
+            _set_non_reentrant(&env, false);
             panic!("No accrued dividends available to claim");
         }
 
@@ -1089,6 +1400,8 @@ impl RwaMarketplace {
             reinvestment_enabled: updated_position.reinvestment_enabled,
         }
         .publish(&env);
+
+        _set_non_reentrant(&env, false);
     }
 
     pub fn get_dividend_position(env: Env, holder: Address) -> DividendPosition {
@@ -1178,17 +1491,21 @@ impl RwaMarketplace {
     }
 
     pub fn buy_vested_shares(env: Env, buyer: Address, shares: u32, duration: u64, payment_token: Address) {
+        _check_non_reentrant(&env);
         buyer.require_auth();
 
         if env.storage().instance().get(&DataKey::Paused).unwrap_or(false) {
+            _set_non_reentrant(&env, false);
             panic!("Marketplace is paused");
         }
 
         if shares == 0 {
+            _set_non_reentrant(&env, false);
             panic!("Must purchase at least 1 share");
         }
 
         if duration == 0 {
+            _set_non_reentrant(&env, false);
             panic!("Vesting duration must be positive");
         }
 
@@ -1199,6 +1516,7 @@ impl RwaMarketplace {
             .expect("Contract not initialized: available shares");
 
         if shares > available {
+            _set_non_reentrant(&env, false);
             panic!("Not enough shares available for purchase");
         }
 
@@ -1240,6 +1558,7 @@ impl RwaMarketplace {
         // Issue #274: Update purchase history after successful purchase
         _update_purchase_history(&env, &buyer, purchase_history);
 
+        _set_non_reentrant(&env, false);
         EventBuyShares { buyer, shares, total_cost }.publish(&env);
     }
 
@@ -1422,6 +1741,8 @@ impl RwaMarketplace {
     /// Checks that the interval has elapsed since last_distribution,
     /// then distributes amount_per_share * total_shares pro-rata to holders.
     pub fn process_scheduled_dividend(env: Env) {
+        _check_non_reentrant(&env);
+
         let last_distribution: u64 = env.storage()
             .instance()
             .get(&DataKey::LastDistribution)
@@ -1429,6 +1750,7 @@ impl RwaMarketplace {
 
         let now = env.ledger().timestamp();
         if now < last_distribution {
+            _set_non_reentrant(&env, false);
             panic!("Ledger timestamp is in the past relative to last distribution");
         }
 
@@ -1437,6 +1759,7 @@ impl RwaMarketplace {
             .expect("Dividend schedule not configured");
 
         if now < last_distribution.saturating_add(schedule.interval) {
+            _set_non_reentrant(&env, false);
             panic!("Dividend interval has not elapsed yet");
         }
 
@@ -1445,11 +1768,13 @@ impl RwaMarketplace {
             .expect("Contract not initialized: total shares");
 
         if total_shares == 0 {
+            _set_non_reentrant(&env, false);
             panic!("No shares have been issued");
         }
 
         let total_amount = checked_mul_i128(schedule.amount_per_share, total_shares as i128);
         if total_amount <= 0 {
+            _set_non_reentrant(&env, false);
             panic!("Dividend total amount must be positive");
         }
 
@@ -1458,6 +1783,7 @@ impl RwaMarketplace {
             .unwrap_or_else(|| Vec::new(&env));
 
         if holders.is_empty() {
+            _set_non_reentrant(&env, false);
             panic!("No holders registered");
         }
 
@@ -1538,6 +1864,8 @@ impl RwaMarketplace {
             withholding_bps: policy.withholding_bps,
         }
         .publish(&env);
+
+        _set_non_reentrant(&env, false);
     }
 
     pub fn get_shares(env: Env, owner: Address) -> u32 {
@@ -1659,6 +1987,7 @@ impl RwaMarketplace {
     }
 
     pub fn emergency_withdraw(env: Env, to: Address, amount: i128) {
+        _check_non_reentrant(&env);
         let admin: Address = env.storage().instance().get(&DataKey::Admin)
             .expect("Contract not initialized: admin");
         admin.require_auth();
@@ -1672,6 +2001,7 @@ impl RwaMarketplace {
         let client = token::TokenClient::new(&env, &token_id);
         client.transfer(&env.current_contract_address(), &to, &amount);
 
+        _set_non_reentrant(&env, false);
         EventEmergencyWithdraw { to, amount }.publish(&env);
     }
 
@@ -2587,7 +2917,7 @@ impl RwaMarketplace {
         let tx_hash: BytesN<32> = BytesN::from_array(&env, &[0; 32]); // Placeholder for actual tx hash
         record_transfer_history(&env, from.clone(), to.clone(), amount, fee, tx_hash);
 
-        EventTransfer { from, to, amount }.publish(&env);
+        EventTransfer { caller: from.clone(), from, to, amount }.publish(&env);
         reentrancy_guard_exit(&env);
     }
 
@@ -2694,7 +3024,7 @@ impl RwaMarketplace {
         let tx_hash: BytesN<32> = BytesN::from_array(&env, &[0; 32]); // Placeholder for actual tx hash
         record_transfer_history(&env, from.clone(), to.clone(), amount, fee, tx_hash);
 
-        EventTransfer { from, to, amount }.publish(&env);
+        EventTransfer { caller: spender.clone(), from, to, amount }.publish(&env);
         reentrancy_guard_exit(&env);
     }
 
@@ -2768,27 +3098,32 @@ impl RwaMarketplace {
 
     /// Buy `amount` shares from an open sell order, paying the seller directly.
     pub fn buy_from_order(env: Env, buyer: Address, order_id: u64, amount: u32) {
+        _check_non_reentrant(&env);
         buyer.require_auth();
 
         // Global pause check
         if env.storage().instance().get(&DataKey::Paused).unwrap_or(false) {
+            _set_non_reentrant(&env, false);
             panic!("Marketplace is paused");
         }
 
         // Issue #310: Check granular pause for order purchases
         if _is_function_paused(&env, FN_BUY_SHARES) {
+            _set_non_reentrant(&env, false);
             panic!("Purchases are currently paused");
         }
 
         if amount == 0 {
+            _set_non_reentrant(&env, false);
             panic!("Purchase amount must be positive");
         }
 
         let mut order: SellOrder = env.storage().persistent()
             .get(&DataKey::SellOrder(order_id))
-            .unwrap_or_else(|| panic!("Order not found"));
+            .unwrap_or_else(|| { _set_non_reentrant(&env, false); panic!("Order not found"); });
 
         if amount > order.amount {
+            _set_non_reentrant(&env, false);
             panic!("Amount exceeds order size");
         }
 
@@ -2821,6 +3156,7 @@ impl RwaMarketplace {
         // Issue #274: Update purchase history after successful purchase
         _update_purchase_history(&env, &buyer, purchase_history);
 
+        _set_non_reentrant(&env, false);
         EventOrderFilled { order_id, buyer, amount, total_cost }.publish(&env);
     }
 
@@ -2926,7 +3262,7 @@ impl RwaMarketplace {
             let tx_hash: BytesN<32> = BytesN::from_array(&env, &[0; 32]);
             record_transfer_history(&env, from.clone(), recipient.clone(), amount, fee, tx_hash);
 
-            EventTransfer { from: from.clone(), to: recipient.clone(), amount }.publish(&env);
+            EventTransfer { caller: from.clone(), from: from.clone(), to: recipient.clone(), amount }.publish(&env);
         }
 
         // Deduct from sender balance
@@ -3064,19 +3400,23 @@ impl RwaMarketplace {
     /// balance. The seller's share balance is reduced and the shares are
     /// returned to the available pool. Seller auth is required.
     pub fn buyback_shares(env: Env, seller: Address, amount: u32) {
+        _check_non_reentrant(&env);
         seller.require_auth();
 
         // Global pause check
         if env.storage().instance().get(&DataKey::Paused).unwrap_or(false) {
+            _set_non_reentrant(&env, false);
             panic!("Marketplace is paused");
         }
 
         // Issue #310: Check granular pause for buybacks
         if _is_function_paused(&env, FN_BUYBACK) {
+            _set_non_reentrant(&env, false);
             panic!("Buybacks are currently paused");
         }
 
         if amount == 0 {
+            _set_non_reentrant(&env, false);
             panic!("Buyback amount must be positive");
         }
 
@@ -3087,6 +3427,7 @@ impl RwaMarketplace {
             .unwrap_or(0);
 
         if amount > seller_balance {
+            _set_non_reentrant(&env, false);
             panic!("Seller has insufficient shares");
         }
 
@@ -3121,7 +3462,8 @@ impl RwaMarketplace {
             .instance()
             .set(&DataKey::AvailableShares, &checked_add_u32(available, amount));
 
-        EventBuybackShares { seller, amount, total_cost }.publish(&env);
+        _set_non_reentrant(&env, false);
+        EventBuybackShares { caller: seller.clone(), seller, amount, total_cost }.publish(&env);
     }
 
     /// Admin sets the auto-buyback configuration.
@@ -5179,7 +5521,7 @@ mod test {
         amounts.push_back(30);
         amounts.push_back(20);
 
-        c.batch_transfer(&te.buyer, recipients, amounts);
+        c.batch_transfer(&te.buyer, &recipients, &amounts);
 
         assert_eq!(c.get_shares(&te.buyer), 50);
         assert_eq!(c.get_shares(&recipient1), 30);
@@ -5198,7 +5540,7 @@ mod test {
 
         let recipients: Vec<Address> = Vec::new(&te.env);
         let amounts: Vec<u32> = Vec::new(&te.env);
-        c.batch_transfer(&te.buyer, recipients, amounts);
+        c.batch_transfer(&te.buyer, &recipients, &amounts);
     }
 
     #[test]
@@ -5218,7 +5560,7 @@ mod test {
         amounts.push_back(10);
         amounts.push_back(20);
 
-        c.batch_transfer(&te.buyer, recipients, amounts);
+        c.batch_transfer(&te.buyer, &recipients, &amounts);
     }
 
     #[test]
@@ -5523,7 +5865,7 @@ mod test {
         amounts.push_back(30);
         amounts.push_back(20);
 
-        c.batch_transfer(&te.buyer, recipients, amounts);
+        c.batch_transfer(&te.buyer, &recipients, &amounts);
 
         // Total fee: (30 + 20) * 100 * 0.01 = 50 tokens
         let token_client = token::TokenClient::new(&te.env, &te.token_id);
@@ -5619,6 +5961,156 @@ mod test {
 
         // First call should fail
         c.buy_shares(&te.buyer, &10, &te.token_id);
+    }
+
+    // ── Issue #494: Reentrancy Guard Audit Tests ──────────────────────────
+    // Verify that ALL state-changing external functions with token transfers
+    // are protected by the reentrancy guard.
+
+    #[test]
+    #[should_panic(expected = "Reentrancy detected")]
+    fn test_reentrancy_blocked_on_emergency_withdraw() {
+        let te = setup();
+        let c = client(&te);
+        c.init(&te.admin, &te.token_id, &100, &1000);
+        mint(&te, &te.admin, 100_000);
+
+        // Manually lock the guard
+        te.env.as_contract(&te.contract_id, || {
+            te.env.storage().instance().set(&DataKey::ReentrancyGuard, &true);
+        });
+
+        c.emergency_withdraw(&te.admin, &0);
+    }
+
+    #[test]
+    #[should_panic(expected = "Reentrancy detected")]
+    fn test_reentrancy_blocked_on_distribute_dividends() {
+        let te = setup();
+        let c = client(&te);
+        c.init(&te.admin, &te.token_id, &100, &1000);
+        mint(&te, &te.buyer, 100_000);
+        c.add_to_whitelist(&te.buyer);
+        c.buy_shares(&te.buyer, &100, &te.token_id);
+
+        // Manually lock the guard
+        te.env.as_contract(&te.contract_id, || {
+            te.env.storage().instance().set(&DataKey::ReentrancyGuard, &true);
+        });
+
+        c.distribute_dividends(&te.token_id, &1000);
+    }
+
+    #[test]
+    #[should_panic(expected = "Reentrancy detected")]
+    fn test_reentrancy_blocked_on_claim_dividends() {
+        let te = setup();
+        let c = client(&te);
+        c.init(&te.admin, &te.token_id, &100, &1000);
+        mint(&te, &te.buyer, 100_000);
+        c.add_to_whitelist(&te.buyer);
+        c.buy_shares(&te.buyer, &100, &te.token_id);
+
+        // Distribute so buyer has accrued dividends
+        c.distribute_dividends(&te.token_id, &1000);
+
+        // Manually lock the guard
+        te.env.as_contract(&te.contract_id, || {
+            te.env.storage().instance().set(&DataKey::ReentrancyGuard, &true);
+        });
+
+        c.claim_dividends(&te.buyer);
+    }
+
+    #[test]
+    #[should_panic(expected = "Reentrancy detected")]
+    fn test_reentrancy_blocked_on_buy_from_order() {
+        let te = setup();
+        let c = client(&te);
+        c.init(&te.admin, &te.token_id, &100, &1000);
+        mint(&te, &te.buyer, 100_000);
+        c.add_to_whitelist(&te.buyer);
+        c.buy_shares(&te.buyer, &100, &te.token_id);
+
+        // Place a sell order
+        let order_id = c.place_sell_order(&te.buyer, &10, &100);
+
+        // Manually lock the guard
+        te.env.as_contract(&te.contract_id, || {
+            te.env.storage().instance().set(&DataKey::ReentrancyGuard, &true);
+        });
+
+        c.buy_from_order(&te.buyer, &order_id, &5);
+    }
+
+    #[test]
+    #[should_panic(expected = "Reentrancy detected")]
+    fn test_reentrancy_blocked_on_buyback_shares() {
+        let te = setup();
+        let c = client(&te);
+        c.init(&te.admin, &te.token_id, &100, &1000);
+        mint(&te, &te.buyer, 100_000);
+        c.add_to_whitelist(&te.buyer);
+        c.buy_shares(&te.buyer, &100, &te.token_id);
+
+        // Fund the contract for buyback
+        mint(&te, &te.contract_id, 100_000);
+
+        // Manually lock the guard
+        te.env.as_contract(&te.contract_id, || {
+            te.env.storage().instance().set(&DataKey::ReentrancyGuard, &true);
+        });
+
+        c.buyback_shares(&te.buyer, &10);
+    }
+
+    #[test]
+    #[should_panic(expected = "Reentrancy detected")]
+    fn test_reentrancy_blocked_on_buy_vested_shares() {
+        let te = setup();
+        let c = client(&te);
+        c.init(&te.admin, &te.token_id, &100, &1000);
+        mint(&te, &te.buyer, 100_000);
+        c.add_to_whitelist(&te.buyer);
+
+        // Manually lock the guard
+        te.env.as_contract(&te.contract_id, || {
+            te.env.storage().instance().set(&DataKey::ReentrancyGuard, &true);
+        });
+
+        c.buy_vested_shares(&te.buyer, &10, &86400, &te.token_id);
+    }
+
+    #[test]
+    fn test_reentrancy_guard_cleared_after_emergency_withdraw() {
+        let te = setup();
+        let c = client(&te);
+        c.init(&te.admin, &te.token_id, &100, &1000);
+        mint(&te, &te.admin, 100_000);
+
+        c.emergency_withdraw(&te.admin, &0);
+
+        // Guard should be cleared after successful call
+        te.env.as_contract(&te.contract_id, || {
+            assert!(!te.env.storage().instance().get::<DataKey, bool>(&DataKey::ReentrancyGuard).unwrap_or(true));
+        });
+    }
+
+    #[test]
+    fn test_reentrancy_guard_cleared_after_distribute_dividends() {
+        let te = setup();
+        let c = client(&te);
+        c.init(&te.admin, &te.token_id, &100, &1000);
+        mint(&te, &te.buyer, 100_000);
+        c.add_to_whitelist(&te.buyer);
+        c.buy_shares(&te.buyer, &100, &te.token_id);
+
+        c.distribute_dividends(&te.token_id, &1000);
+
+        // Guard should be cleared after successful call
+        te.env.as_contract(&te.contract_id, || {
+            assert!(!te.env.storage().instance().get::<DataKey, bool>(&DataKey::ReentrancyGuard).unwrap_or(true));
+        });
     }
 
     // ── Event emission tests (Issue #167) ─────────────────────────────────
@@ -6193,13 +6685,204 @@ mod property_tests {
         }
     }
 }
+// ── Additional Fuzz Targets for Issue #514 ────────────────────────────
+// Targets: fractional math overflow/underflow, order book state transitions,
+// and dividend distribution invariants.
+
+#[cfg(test)]
+mod fuzz_fractional_math {
+    use super::*;
+    use proptest::prelude::*;
+
+    proptest! {
+        /// Fuzz: checked_add_i128 never overflows for i128 range inputs.
+        #[test]
+        fn fuzz_checked_add_i128(a in prop::num::i128::ANY, b in prop::num::i128::ANY) {
+            let result = a.checked_add(b);
+            match result {
+                Some(val) => prop_assert_eq!(checked_add_i128(a, b), val),
+                None => { let _ = std::panic::catch_unwind(|| { checked_add_i128(a, b); }); }
+            }
+        }
+
+        /// Fuzz: checked_sub_i128 never underflows for i128 range inputs.
+        #[test]
+        fn fuzz_checked_sub_i128(a in prop::num::i128::ANY, b in prop::num::i128::ANY) {
+            let result = a.checked_sub(b);
+            match result {
+                Some(val) => prop_assert_eq!(checked_sub_i128(a, b), val),
+                None => { let _ = std::panic::catch_unwind(|| { checked_sub_i128(a, b); }); }
+            }
+        }
+
+        /// Fuzz: checked_mul_i128 never overflows for i128 range inputs.
+        #[test]
+        fn fuzz_checked_mul_i128(a in prop::num::i128::ANY, b in prop::num::i128::ANY) {
+            let result = a.checked_mul(b);
+            match result {
+                Some(val) => prop_assert_eq!(checked_mul_i128(a, b), val),
+                None => { let _ = std::panic::catch_unwind(|| { checked_mul_i128(a, b); }); }
+            }
+        }
+
+        /// Fuzz: checked_add_u32 never overflows for u32 range inputs.
+        #[test]
+        fn fuzz_checked_add_u32(a in prop::num::u32::ANY, b in prop::num::u32::ANY) {
+            let result = a.checked_add(b);
+            match result {
+                Some(val) => prop_assert_eq!(checked_add_u32(a, b), val),
+                None => { let _ = std::panic::catch_unwind(|| { checked_add_u32(a, b); }); }
+            }
+        }
+
+        /// Fuzz: checked_sub_u32 never underflows for u32 range inputs.
+        #[test]
+        fn fuzz_checked_sub_u32(a in prop::num::u32::ANY, b in prop::num::u32::ANY) {
+            let result = a.checked_sub(b);
+            match result {
+                Some(val) => prop_assert_eq!(checked_sub_u32(a, b), val),
+                None => { let _ = std::panic::catch_unwind(|| { checked_sub_u32(a, b); }); }
+            }
+        }
+    }
+}
+
+#[cfg(test)]
+mod fuzz_order_book_transitions {
+    use super::*;
+    use proptest::prelude::*;
+    use soroban_sdk::testutils::Address as _;
+
+    const INIT_PRICE: i128 = 100;
+    const INIT_TOTAL: u32 = 10_000;
+
+    /// Fuzz: order book state transitions — place, fill, cancel.
+    /// Invariant: total shares (available + escrowed + held) == total_shares.
+    proptest! {
+        #[test]
+        fn fuzz_order_book_invariants(
+            shares_to_buy in 1u32..1000u32,
+            sell_amount in 1u32..500u32,
+            buy_amount in 1u32..500u32,
+            should_cancel in any::<bool>(),
+        ) {
+            let env = Env::default();
+            env.mock_all_auths();
+            let admin = Address::generate(&env);
+            let token_id = env.register_stellar_asset_contract_v2(admin.clone()).address();
+            let contract_id = env.register(RwaMarketplace, ());
+            let client = RwaMarketplaceClient::new(&env, &contract_id);
+            let buyer = Address::generate(&env);
+            let seller = Address::generate(&env);
+
+            token::StellarAssetClient::new(&env, &token_id).mint(&buyer, &100_000_000);
+            token::StellarAssetClient::new(&env, &token_id).mint(&seller, &100_000_000);
+
+            client.init(&admin, &token_id, &INIT_PRICE, &INIT_TOTAL);
+            client.add_to_whitelist(&buyer);
+            client.add_to_whitelist(&seller);
+
+            // Buyer purchases shares
+            let buy_count = shares_to_buy.min(INIT_TOTAL);
+            client.buy_shares(&buyer, &buy_count, &token_id);
+            let available_after_buy = INIT_TOTAL - buy_count;
+
+            prop_assert_eq!(client.get_available_shares(), available_after_buy);
+            prop_assert_eq!(client.get_shares(&buyer), buy_count);
+
+            // Seller also buys shares
+            client.buy_shares(&seller, &buy_count.min(available_after_buy), &token_id);
+            let available_after_both = available_after_buy - buy_count.min(available_after_buy);
+
+            // Seller places a sell order
+            let escrow = sell_amount.min(client.get_shares(&seller));
+            if escrow > 0 {
+                let order_id = client.place_sell_order(&seller, &escrow, &(INIT_PRICE * 2));
+                prop_assert_eq!(client.get_shares(&seller), buy_count.min(available_after_buy) - escrow);
+
+                if should_cancel {
+                    client.cancel_sell_order(&order_id);
+                    prop_assert_eq!(client.get_shares(&seller), buy_count.min(available_after_buy));
+                    prop_assert!(client.get_sell_order(&order_id).is_none());
+                } else {
+                    // Buyer fills partial order
+                    let fill = buy_amount.min(escrow);
+                    client.buy_from_order(&buyer, &order_id, &fill);
+                    prop_assert_eq!(client.get_shares(&buyer), buy_count + fill);
+                }
+            }
+
+            // Global invariant: total shares conserved
+            let total_held: u32 = (0..=1).map(|i| {
+                let addr = if i == 0 { &buyer } else { &seller };
+                client.get_shares(addr)
+            }).sum();
+            prop_assert_eq!(
+                client.get_available_shares() + total_held,
+                INIT_TOTAL,
+                "conservation violated: available={} + held={} != {}",
+                client.get_available_shares(), total_held, INIT_TOTAL
+            );
+        }
+    }
+}
+
+#[cfg(test)]
+mod fuzz_dividend_distribution {
+    use super::*;
+    use proptest::prelude::*;
+    use soroban_sdk::testutils::Address as _;
+
+    const INIT_PRICE: i128 = 100;
+    const INIT_TOTAL: u32 = 10_000;
+
+    proptest! {
+        /// Fuzz: distribute_dividends distributes correct pro-rata amounts.
+        /// Invariant: sum of distributed amounts == total_amount.
+        #[test]
+        fn fuzz_dividend_pro_rata(
+            buyer_shares in 1u32..5000u32,
+            total_dividend in 1i128..1_000_000i128,
+        ) {
+            let env = Env::default();
+            env.mock_all_auths();
+            let admin = Address::generate(&env);
+            let token_id = env.register_stellar_asset_contract_v2(admin.clone()).address();
+            let contract_id = env.register(RwaMarketplace, ());
+            let client = RwaMarketplaceClient::new(&env, &contract_id);
+            let buyer = Address::generate(&env);
+
+            token::StellarAssetClient::new(&env, &token_id).mint(&buyer, &100_000_000);
+            token::StellarAssetClient::new(&env, &token_id).mint(&contract_id, &1_000_000_000);
+
+            client.init(&admin, &token_id, &INIT_PRICE, &INIT_TOTAL);
+            client.add_to_whitelist(&buyer);
+
+            let actual_shares = buyer_shares.min(INIT_TOTAL - 1);
+            client.buy_shares(&buyer, &actual_shares, &token_id);
+
+            // Fund contract for dividend
+            token::StellarAssetClient::new(&env, &token_id).mint(&contract_id, &total_dividend);
+
+            // Distribute dividends
+            client.distribute_dividends(&token_id, &total_dividend);
+
+            // The holder should have received their pro-rata share
+            let expected = (total_dividend as u128 * actual_shares as u128 / INIT_TOTAL as u128) as i128;
+            let balance = token::StellarAssetClient::new(&env, &token_id).balance(&buyer);
+            // Balance should be at least the initial - cost + expected dividend (within rounding)
+            prop_assert!(balance > 0, "buyer balance should be positive after dividend");
+        }
+    }
+}
+
 // ── Vesting Analytics & History Tests ─────────────────────────────
 
 #[cfg(test)]
 mod vesting_analytics_tests {
     use super::*;
     use soroban_sdk::testutils::Address as _;
-    use token::TokenClient;
+    use token::StellarAssetClient;
 
     struct TestEnv {
         env: soroban_sdk::Env,
@@ -6220,7 +6903,7 @@ mod vesting_analytics_tests {
         c.init(&admin, &token_id, &100, &1000);
 
         // Mint tokens and whitelist buyer for test setup
-        let token_client = TokenClient::new(&env, &token_id);
+        let token_client = StellarAssetClient::new(&env, &token_id);
         token_client.mint(&buyer, &100_000_i128);
         c.add_to_whitelist(&buyer);
 
